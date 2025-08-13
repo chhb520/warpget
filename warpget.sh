@@ -1,118 +1,225 @@
-#!/bin/bash
-# /root/warp-monitor.sh
-# WARP IPv4 & IPv6 自动恢复脚本
 
-# ===== 配置 =====
-TARGET_V4="1.1.1.1"                     # IPv4 Ping 目标
-TARGET_V6="2606:4700:4700::1111"        # IPv6 Ping 目标
-COUNT=5                                 # Ping 次数
-SLEEP_INTERVAL=10                       # 重试间隔
-MAX_RETRY=3                             # 最大重试次数
-LOCK_FILE="/tmp/$(basename $0).lock"
+#!/usr/bin/env bash
 
-# ===== 颜色 =====
-GREEN="\033[0;32m"
-RED="\033[0;31m"
-YELLOW="\033[1;33m"
-BLUE="\033[0;34m"
-NC="\033[0m"
+# =============================================
+# 优化版 WARP IPv4 出口自动恢复脚本
+# =============================================
 
-# ===== 检查依赖 =====
-command -v ping &>/dev/null || { echo "缺少 ping 命令"; exit 1; }
-command -v logger &>/dev/null || logger() { :; } # 兼容无 logger
+# --- 全局配置 ---
+readonly TARGET="1.1.1.1"          # Ping 测试目标 (IPv4)
+readonly COUNT=5                   # Ping 次数
+readonly PING_TIMEOUT=3            # Ping 超时(秒)
+readonly SLEEP_INTERVAL=10         # 重试间隔(秒)
+readonly MAX_RETRY=3               # 最大重试次数
+readonly LOCK_FILE="/tmp/warp_monitor.lock"  # 锁文件路径
+readonly LOG_FILE="/var/log/warp_monitor.log" # 日志文件路径
+readonly WARP_CONFIG="/etc/wireguard/warp.conf" # WARP 配置文件路径
 
-# ===== 锁文件防并发 =====
-if [ -e "$LOCK_FILE" ] && kill -0 "$(cat "$LOCK_FILE")" 2>/dev/null; then
-    log_message="脚本已在运行中 (PID: $(cat "$LOCK_FILE"))，退出。"
-    echo -e "${YELLOW}${log_message}${NC}"
-    logger "${log_message}"
-    exit 1
-fi
-echo $$ > "$LOCK_FILE"
+# --- 颜色配置 ---
+declare -A COLORS=(
+    [RED]="\033[0;31m"
+    [GREEN]="\033[0;32m"
+    [YELLOW]="\033[1;33m"
+    [BLUE]="\033[0;34m"
+    [CYAN]="\033[0;36m"
+    [NC]="\033[0m"
+)
 
-trap 'rm -f "$LOCK_FILE"; echo -e "${BLUE}清理锁文件并退出${NC}"' EXIT
+# --- 日志级别 ---
+declare -A LOG_LEVELS=(
+    [INFO]=0
+    [WARNING]=1
+    [ERROR]=2
+    [CRITICAL]=3
+)
 
-# ===== 检查 root 权限 =====
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}错误: 此脚本需要 root 权限${NC}"
-    exit 1
-fi
+# --- 初始化 ---
+init() {
+    check_root
+    setup_logging
+    check_lock
+    create_lock
+    set_traps
+}
 
-# ===== 检测函数 =====
-check_status() {
-    local ipver=$1 target=$2
-    local result loss
+# --- 检查root权限 ---
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_message "ERROR" "此脚本需要root权限" >&2
+        echo -e "${COLORS[RED]}错误: 请使用 sudo 执行此脚本${COLORS[NC]}" >&2
+        exit 1
+    fi
+}
 
-    if [ "$ipver" = "4" ]; then
-        result=$(ping -4 -q -c ${COUNT} -W 3 ${target} 2>/dev/null)
-    else
-        # 兼容 ping6
-        if command -v ping6 &>/dev/null; then
-            result=$(ping6 -q -c ${COUNT} -W 3 ${target} 2>/dev/null)
+# --- 日志设置 ---
+setup_logging() {
+    mkdir -p "$(dirname "$LOG_FILE")"
+    touch "$LOG_FILE"
+}
+
+# --- 检查锁文件 ---
+check_lock() {
+    if [[ -e "$LOCK_FILE" ]]; then
+        local pid=$(cat "$LOCK_FILE")
+        if ps -p "$pid" > /dev/null; then
+            log_message "WARNING" "脚本已在运行中 (PID: $pid)"
+            echo -e "${COLORS[YELLOW]}警告: 脚本已在运行中${COLORS[NC]}" >&2
+            exit 1
         else
-            result=$(ping -6 -q -c ${COUNT} -W 3 ${target} 2>/dev/null)
+            log_message "WARNING" "发现陈旧的锁文件，已清除"
+            rm -f "$LOCK_FILE"
         fi
     fi
+}
 
-    loss=$(echo "$result" | grep -oP '\d+(?=% packet loss)')
-    [ -z "$loss" ] && loss=100
+# --- 创建锁文件 ---
+create_lock() {
+    echo $$ > "$LOCK_FILE"
+}
+
+# --- 设置陷阱 ---
+set_traps() {
+    trap 'cleanup' EXIT INT TERM
+}
+
+# --- 清理函数 ---
+cleanup() {
+    rm -f "$LOCK_FILE"
+    log_message "INFO" "脚本执行结束，已清理锁文件"
+    echo -e "\n${COLORS[CYAN]}脚本执行完成${COLORS[NC]}"
+}
+
+# --- 日志记录函数 ---
+log_message() {
+    local level=$1
+    local message=$2
+    local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+    
+    # 写入系统日志
+    logger -t "WARP_Monitor" "[$level] $message"
+    
+    # 写入日志文件
+    echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+    
+    # 控制台输出
+    case $level in
+        "ERROR"|"CRITICAL")
+            echo -e "${COLORS[RED]}[$timestamp] [$level] $message${COLORS[NC]}" >&2
+            ;;
+        "WARNING")
+            echo -e "${COLORS[YELLOW]}[$timestamp] [$level] $message${COLORS[NC]}"
+            ;;
+        *)
+            echo -e "${COLORS[GREEN]}[$timestamp] [$level] $message${COLORS[NC]}"
+            ;;
+    esac
+}
+
+# --- 检测IPv4连通性 ---
+check_ipv4_connectivity() {
+    if ping -4 -q -c "$COUNT" -W "$PING_TIMEOUT" "$TARGET" &> /dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# --- 获取丢包率 ---
+get_loss_rate() {
+    local loss=$(ping -4 -q -c "$COUNT" -W "$PING_TIMEOUT" "$TARGET" 2>/dev/null | 
+                grep -oP '\d+(?=% packet loss)' || echo "100")
     echo "$loss"
-    [ "$loss" -lt 100 ] # true 表示连通
 }
 
-# ===== 重置 WARP =====
-reset_warp() {
-    echo -e "${YELLOW}正在重新获取 WARP 出口...${NC}"
-    wg-quick down warp &>/dev/null
-    sleep 1
-    wg-quick up warp &>/dev/null
-    sleep 5
-    echo -e "${BLUE}WARP 出口重置完成${NC}"
+# --- 重置WARP v4出口 ---
+reset_warp_v4() {
+    log_message "INFO" "开始重置WARP v4出口..."
+    
+    # 关闭WARP接口
+    if ! wg-quick down warp &>> "$LOG_FILE"; then
+        log_message "ERROR" "关闭WARP接口失败"
+        return 1
+    fi
+    
+    # 修改配置文件
+    if ! sed -i "s/Endpoint.*/Endpoint = engage.cloudflareclient.com:4500/" "$WARP_CONFIG"; then
+        log_message "ERROR" "修改WARP配置文件失败"
+        return 1
+    fi
+    
+    # 重新启用WARP
+    if ! warp o &>> "$LOG_FILE"; then
+        log_message "ERROR" "重新启用WARP失败"
+        return 1
+    fi
+    
+    log_message "INFO" "WARP v4出口重置完成"
+    return 0
 }
 
-# ===== 主逻辑 =====
-echo -e "${GREEN}===============================================${NC}"
-echo -e "${GREEN}     WARP IPv4 & IPv6 出口自动恢复脚本启动${NC}"
-echo -e "${GREEN}===============================================${NC}"
+# --- 显示网络状态 ---
+show_network_status() {
+    local loss=$(get_loss_rate)
+    local status
+    
+    if [[ "$loss" -eq "100" ]]; then
+        status="${COLORS[RED]}断开连接${COLORS[NC]}"
+    elif [[ "$loss" -gt "20" ]]; then
+        status="${COLORS[YELLOW]}不稳定 (丢包率 ${loss}%)${COLORS[NC]}"
+    else
+        status="${COLORS[GREEN]}正常 (丢包率 ${loss}%)${COLORS[NC]}"
+    fi
+    
+    echo -e "当前网络状态: $status"
+    echo -e "目标服务器: $TARGET"
+    echo -e "测试次数: $COUNT"
+    echo -e "超时设置: ${PING_TIMEOUT}秒"
+}
 
-logger "开始执行 WARP IPv4 & IPv6 连通性检测..."
-retry_count=0
-
-while [ $retry_count -lt $MAX_RETRY ]; do
-    retry_count=$((retry_count + 1))
-
-    loss4=$(check_status 4 $TARGET_V4); status4=$?
-    loss6=$(check_status 6 $TARGET_V6); status6=$?
-
-    if [ $status4 -eq 0 ] && [ $status6 -eq 0 ]; then
-        log="[IPv4 丢包率 ${loss4}%] [IPv6 丢包率 ${loss6}%] 网络正常，无需处理"
-        echo -e "${GREEN}${log}${NC}"
-        logger "${log}"
+# --- 主程序 ---
+main() {
+    init
+    
+    log_message "INFO" "========== WARP IPv4出口监控启动 =========="
+    echo -e "${COLORS[BLUE]}===============================================${COLORS[NC]}"
+    echo -e "${COLORS[BLUE]}      WARP IPv4出口自动恢复脚本启动${COLORS[NC]}"
+    echo -e "${COLORS[BLUE]}===============================================${COLORS[NC]}"
+    
+    show_network_status
+    
+    # 首次检查
+    if check_ipv4_connectivity; then
+        local loss=$(get_loss_rate)
+        log_message "INFO" "IPv4网络连通正常 (丢包率 ${loss}%)"
         exit 0
     fi
+    
+    # 重试循环
+    local retry_count=0
+    while [[ $retry_count -lt $MAX_RETRY ]]; do
+        retry_count=$((retry_count + 1))
+        local loss=$(get_loss_rate)
+        
+        log_message "WARNING" "[尝试 $retry_count/$MAX_RETRY] IPv4网络中断 (丢包率 ${loss}%)"
+        
+        if reset_warp_v4; then
+            log_message "INFO" "等待 ${SLEEP_INTERVAL} 秒让网络稳定..."
+            sleep "$SLEEP_INTERVAL"
+            
+            if check_ipv4_connectivity; then
+                loss=$(get_loss_rate)
+                log_message "INFO" "IPv4网络已恢复 (丢包率 ${loss}%)"
+                show_network_status
+                exit 0
+            fi
+        fi
+    done
+    
+    # 达到最大重试次数
+    log_message "ERROR" "已达到最大重试次数，IPv4网络仍未恢复"
+    show_network_status
+    exit 1
+}
 
-    if [ $status4 -ne 0 ] && [ $status6 -ne 0 ]; then
-        log="[IPv4 丢包率 ${loss4}%] [IPv6 丢包率 ${loss6}%] 网络均中断，执行 WARP 重置"
-        echo -e "${RED}${log}${NC}"
-        logger "${log}"
-        reset_warp
-    elif [ $status4 -ne 0 ]; then
-        log="[IPv4 丢包率 ${loss4}%] IPv4 网络中断，执行 WARP 重置"
-        echo -e "${RED}${log}${NC}"
-        logger "${log}"
-        reset_warp
-    elif [ $status6 -ne 0 ]; then
-        log="[IPv6 丢包率 ${loss6}%] IPv6 网络中断，执行 WARP 重置"
-        echo -e "${RED}${log}${NC}"
-        logger "${log}"
-        reset_warp
-    fi
-
-    echo -e "${YELLOW}等待 ${SLEEP_INTERVAL} 秒让网络稳定...${NC}"
-    sleep ${SLEEP_INTERVAL}
-done
-
-log="已达到最大重试次数(${MAX_RETRY})，网络仍未恢复，请手动检查 WARP 配置"
-echo -e "${RED}${log}${NC}"
-logger "${log}"
-exit 1
+# --- 执行主程序 ---
+main
