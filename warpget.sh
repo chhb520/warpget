@@ -1,4 +1,3 @@
-```bash
 #!/bin/bash
 # /root/warp-monitor-smart.sh
 # WARP IPv4 & IPv6 自动恢复脚本（智能模式）
@@ -131,4 +130,3 @@ log="已达到最大重试次数(${MAX_RETRY})，网络仍未恢复，请手动�
 echo -e "${RED}${log}${NC}"
 logger "${log}"
 exit 1
-```
