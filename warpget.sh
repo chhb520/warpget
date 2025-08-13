@@ -85,7 +85,7 @@ set_traps() {
 # --- 清理函数 ---
 cleanup() {
     rm -f "$LOCK_FILE"
-    log_message "INFO" "脚本执行结束，已清理锁文件"
+    log_message "INFO" "脚本执行结束，已清理琐碎文件"
     echo -e "\n${COLORS[CYAN]}脚本执行完成${COLORS[NC]}"
 }
 
